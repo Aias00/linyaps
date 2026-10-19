@@ -153,8 +153,9 @@ public:
     getRefStatistics(const RefMetaData &meta) const noexcept;
 
     // Export desktop integration entries for all or one module of an application reference.
-    void exportAppReference(const package::Reference &ref,
-                            const std::optional<std::string> &module = std::nullopt) noexcept;
+    utils::error::Result<void>
+    exportAppReference(const package::Reference &ref,
+                       const std::optional<std::string> &module = std::nullopt) noexcept;
     void exportLayerSignData(const package::Reference &ref,
                              const std::string &module = "binary") noexcept;
     void exportLayerSignData(const api::types::v1::RepositoryCacheLayersItem &item) noexcept;
@@ -163,9 +164,9 @@ public:
                               const std::optional<std::string> &module = std::nullopt) noexcept;
     void unexportLayerSignData(const api::types::v1::RepositoryCacheLayersItem &item) noexcept;
     void updateSharedInfo() noexcept;
-    utils::error::Result<void> markDeleted(const package::Reference &ref,
-                                           bool deleted,
-                                           const std::string &module = "binary") noexcept;
+    virtual utils::error::Result<void> markDeleted(const package::Reference &ref,
+                                                   bool deleted,
+                                                   const std::string &module = "binary") noexcept;
     bool isMarkedDeleted(const package::Reference &ref, const std::string &module) const noexcept;
 
     // 扫描layers变动，重新合并变动layer的modules

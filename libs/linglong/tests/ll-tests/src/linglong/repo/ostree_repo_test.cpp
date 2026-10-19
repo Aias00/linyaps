@@ -16,16 +16,22 @@
 #include "linglong/repo/client_factory.h"
 #include "linglong/repo/config.h"
 #include "linglong/repo/ostree_repo.h"
+#include "linglong/repo/remote_packages.h"
 #include "linglong/utils/error/error.h"
+#include "linglong/utils/log/log.h"
 
 #include <nlohmann/json.hpp>
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+
+#include <sys/resource.h>
+#include <unistd.h>
 
 namespace linglong::repo::test {
 
@@ -1268,6 +1274,52 @@ TEST_F(RepoTest, exportAppBinariesCreatesDefaultAppidScript)
               std::string::npos);
 }
 
+TEST_F(RepoTest, exportAppBinariesReportsFilesystemErrors)
+{
+    for (bool blockScript : { true, false }) {
+        SCOPED_TRACE(blockScript ? "script creation" : "symlink creation");
+        TempDir tempDir;
+        auto config = api::types::v1::RepoConfigV2{ .defaultRepo = "", .repos = {}, .version = 2 };
+        auto ostreeRepo = std::make_unique<MockOstreeRepo>(tempDir.path(), config);
+        api::types::v1::RepositoryCacheLayersItem item{
+            .commit = "bin-commit",
+            .info =
+              api::types::v1::PackageInfoV2{
+                .command = std::vector<std::string>{ "myapp" },
+                .id = "com.example.app",
+                .kind = "app",
+                .packageInfoV2Module = "binary",
+              },
+        };
+        auto entriesDir = tempDir.path() / "entries";
+        auto blocker = blockScript ? entriesDir / "bin/apps/com.example.app/bin/com.example.app"
+                                   : entriesDir / "bin/com.example.app";
+        fs::create_directories(blocker);
+        std::ofstream(blocker / "keep") << "keep";
+
+        EXPECT_FALSE(ostreeRepo->exportAppBinaries(entriesDir, item).has_value());
+        EXPECT_TRUE(fs::exists(blocker / "keep"));
+    }
+}
+
+TEST_F(RepoTest, exportDirReportsLinkFailure)
+{
+    TempDir tempDir;
+    auto config = api::types::v1::RepoConfigV2{ .defaultRepo = "", .repos = {}, .version = 2 };
+    auto ostreeRepo = std::make_unique<MockOstreeRepo>(tempDir.path(), config);
+    auto source = tempDir.path() / "source";
+    auto entriesDir = tempDir.path() / "entries";
+    fs::create_directories(source);
+    std::ofstream(source / "icon.png") << "icon";
+    auto blocker = entriesDir / "share/icons/icon.png.linyaps.tmp";
+    fs::create_directories(blocker);
+    std::ofstream(blocker / "keep") << "keep";
+
+    EXPECT_FALSE(
+      ostreeRepo->exportDir("com.example.app", source, entriesDir, "share/icons", 10).has_value());
+    EXPECT_TRUE(fs::exists(blocker / "keep"));
+}
+
 TEST_F(RepoTest, exportAppBinariesExportsFullCommandArray)
 {
     TempDir tempDir;
@@ -1402,7 +1454,10 @@ TEST_F(RepoTest, exportAppBinariesIdempotentUpsert)
                   std::string::npos);
     }
 
-    // Changed command: the wrapper is overwritten to reflect the new command
+    // An already-open script must keep its complete old contents across replacement.
+    std::ifstream previousScript(scriptPath);
+    ASSERT_TRUE(previousScript.is_open());
+    // Changed command: the wrapper is replaced to reflect the new command
     result = ostreeRepo->exportAppBinaries(entriesDir, makeItem({ "newcmd", "--flag" }));
     ASSERT_TRUE(result.has_value()) << result.error().message();
     {
@@ -1414,6 +1469,60 @@ TEST_F(RepoTest, exportAppBinariesIdempotentUpsert)
         // the old command must be gone
         EXPECT_EQ(content.find("'myapp'"), std::string::npos);
     }
+    std::string previousContent((std::istreambuf_iterator<char>(previousScript)),
+                                std::istreambuf_iterator<char>());
+    EXPECT_NE(previousContent.find("'myapp'"), std::string::npos);
+    EXPECT_EQ(previousContent.find("'newcmd'"), std::string::npos);
+}
+
+TEST_F(RepoTest, exportAppBinariesPreservesOldScriptWhenWriteFails)
+{
+    TempDir tempDir;
+    auto config = api::types::v1::RepoConfigV2{ .defaultRepo = "", .repos = {}, .version = 2 };
+    auto ostreeRepo = std::make_unique<MockOstreeRepo>(tempDir.path(), config);
+    api::types::v1::RepositoryCacheLayersItem item{
+        .commit = "bin-commit",
+        .info =
+          api::types::v1::PackageInfoV2{
+            .command = std::vector<std::string>{ "old-command" },
+            .id = "com.example.app",
+            .kind = "app",
+            .packageInfoV2Module = "binary",
+          },
+    };
+    auto entriesDir = tempDir.path() / "entries";
+    ASSERT_TRUE(ostreeRepo->exportAppBinaries(entriesDir, item).has_value());
+
+    // Restrict only the child so a failed write is deterministic even when tests run as root.
+    ASSERT_EXIT(
+      {
+          // The death-test stderr capture is also a regular file subject to RLIMIT_FSIZE.
+          utils::log::setLogBackend(utils::log::LogBackend::None);
+          struct rlimit limit{};
+          if (::getrlimit(RLIMIT_FSIZE, &limit) != 0) {
+              _exit(2);
+          }
+          limit.rlim_cur = 0;
+          if (::setrlimit(RLIMIT_FSIZE, &limit) != 0) {
+              _exit(3);
+          }
+          std::signal(SIGXFSZ, SIG_IGN);
+          item.info.command = std::vector<std::string>{ "new-command" };
+          std::ignore = ostreeRepo->exportAppBinaries(entriesDir, item);
+          _exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      ".*");
+
+    auto scriptPath = entriesDir / "bin/apps/com.example.app/bin/com.example.app";
+    std::ifstream script(scriptPath);
+    ASSERT_TRUE(script.is_open());
+    std::string content((std::istreambuf_iterator<char>(script)), std::istreambuf_iterator<char>());
+    EXPECT_NE(content.find("'old-command'"), std::string::npos);
+    EXPECT_EQ(content.find("'new-command'"), std::string::npos);
+    EXPECT_EQ(
+      std::distance(fs::directory_iterator(scriptPath.parent_path()), fs::directory_iterator{}),
+      1);
 }
 
 TEST_F(RepoTest, unexportAppEntriesRemovesBinaryScripts)
@@ -1605,3 +1714,67 @@ TEST_F(RepoTest, unexportRemovesWrapperWhenAllLayersOfAppRemoved)
 } // namespace
 
 } // namespace linglong::repo::test
+
+TEST(RemotePackagesTest, ModulesBelongToSelectedRepository)
+{
+    using namespace linglong;
+    const auto ref = package::Reference::parse("main:com.example.app/1.0.0/x86_64");
+    ASSERT_TRUE(ref.has_value());
+    // The same upstream name can be configured under different local aliases.
+    api::types::v1::Repo first{ .alias = "first",
+                                .name = "origin",
+                                .priority = 0,
+                                .url = "https://first.example/repo" };
+    api::types::v1::Repo second{ .alias = "second",
+                                 .name = "origin",
+                                 .priority = 0,
+                                 .url = "https://second.example/repo" };
+    api::types::v1::PackageInfoV2 binary{
+        .arch = { "x86_64" },
+        .channel = "main",
+        .id = "com.example.app",
+        .packageInfoV2Module = "binary",
+        .version = "1.0.0",
+    };
+    auto develop = binary;
+    develop.packageInfoV2Module = "develop";
+    repo::RemotePackages candidates;
+    candidates.addPackages(first, { binary });
+    candidates.addPackages(second, { develop });
+
+    auto latest = candidates.getLatestPackage();
+    ASSERT_TRUE(latest.has_value());
+    const package::ReferenceWithRepo selected{ .repo = latest->first.get(), .reference = *ref };
+    EXPECT_EQ(candidates.getReferenceModules(selected), std::vector<std::string>{ "binary" });
+    EXPECT_EQ(candidates.getReferenceModules({ .repo = second, .reference = *ref }),
+              std::vector<std::string>{ "develop" });
+
+    first.alias = "missing";
+    EXPECT_TRUE(candidates.getReferenceModules({ .repo = first, .reference = *ref }).empty());
+}
+
+TEST(RemotePackagesTest, ModulesMatchReferenceWithinUnaliasedRepository)
+{
+    using namespace linglong;
+    const auto ref = package::Reference::parse("main:com.example.app/1.0.0/x86_64");
+    ASSERT_TRUE(ref.has_value());
+    api::types::v1::Repo source{ .name = "source",
+                                 .priority = 0,
+                                 .url = "https://source.example/repo" };
+    api::types::v1::PackageInfoV2 binary{
+        .arch = { "x86_64" },
+        .channel = "main",
+        .id = "com.example.app",
+        .packageInfoV2Module = "binary",
+        .version = "1.0.0",
+    };
+    auto develop = binary;
+    develop.packageInfoV2Module = "develop";
+    auto otherVersion = develop;
+    otherVersion.version = "2.0.0";
+    otherVersion.packageInfoV2Module = "debug";
+    repo::RemotePackages candidates;
+    candidates.addPackages(source, { binary, develop, otherVersion });
+    EXPECT_EQ(candidates.getReferenceModules({ .repo = source, .reference = *ref }),
+              (std::vector<std::string>{ "binary", "develop" }));
+}

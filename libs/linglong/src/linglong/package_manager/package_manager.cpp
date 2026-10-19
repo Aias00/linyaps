@@ -386,7 +386,10 @@ utils::error::Result<void> PackageManager::applyApp(
     LINGLONG_TRACE(fmt::format("apply app {}", refStr));
 
     LogI("export new reference", refStr);
-    this->repo->exportAppReference(reference, module);
+    auto exported = this->repo->exportAppReference(reference, module);
+    if (!exported) {
+        return LINGLONG_ERR("failed to export application entries", exported);
+    }
 
     auto res = tryGenerateCache(reference);
     if (!res) {
@@ -1361,16 +1364,17 @@ utils::error::Result<bool> PackageManager::tryUninstallRef(const package::Refere
         auto modules = repo->getModuleList(ref);
         for (const auto &module : modules) {
             auto res = repo->markDeleted(ref, true, module);
-            if (res) {
-                transaction.addRollBack([this, &ref, module]() noexcept {
-                    auto res = repo->markDeleted(ref, false, module);
-                    if (!res) {
-                        LogW(fmt::format("failed to roll back mark deleted {} {}",
-                                         ref.toString(),
-                                         module));
-                    }
-                });
+            if (!res) {
+                return LINGLONG_ERR(res);
             }
+            transaction.addRollBack([this, &ref, module]() noexcept {
+                auto res = repo->markDeleted(ref, false, module);
+                if (!res) {
+                    LogW(fmt::format("failed to roll back mark deleted {} {}",
+                                     ref.toString(),
+                                     module));
+                }
+            });
         }
     } else {
         auto res = uninstallRef(ref);
@@ -1588,7 +1592,8 @@ PackageManager::needToUpgrade(const package::FuzzyReference &fuzzyRef,
     }
 
     if (!local || remoteRef->version > local->version) {
-        auto remoteModules = candidates->getReferenceModules(*remoteRef);
+        auto remoteModules = candidates->getReferenceModules(
+          package::ReferenceWithRepo{ .repo = target->first.get(), .reference = *remoteRef });
         if (remoteModules.empty()) {
             return LINGLONG_ERR(fmt::format("no modules found for {}", remoteRef->toString()),
                                 utils::error::ErrorCode::AppUpgradeFailed);

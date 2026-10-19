@@ -37,6 +37,7 @@ pfl_add_executable(
   src/linglong/package/architecture_test.cpp
   src/linglong/package/elf_handler_test.cpp
   src/linglong/package/fallback_version_test.cpp
+  src/linglong/package/layer_file_bounds_test.cpp
   src/linglong/package/layer_dir_test.cpp
   src/linglong/package/layer_packager_test.cpp
   src/linglong/package_manager/action_test.cpp
@@ -73,6 +74,7 @@ pfl_add_executable(
   src/linglong/utils/filelock_test.cpp
   src/linglong/utils/hooks_test.cpp
   src/linglong/utils/io_test.cpp
+  src/linglong/utils/pipe_stdio_test.cpp
   src/linglong/utils/log.cpp
   src/linglong/utils/namespce.cpp
   src/linglong/utils/overlayfs_test.cpp
@@ -118,3 +120,10 @@ target_include_directories(${tests}
                            PUBLIC ${PROJECT_SOURCE_DIR}/apps/uab/header/src)
 target_include_directories(${tests}
                            PUBLIC ${PROJECT_SOURCE_DIR}/apps/ll-driver-detect/src)
+
+# The fetch helper regressions use local repositories and do not require network access.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(
+  NAME fetch-git-source-clean-workdir
+  COMMAND ${Python3_EXECUTABLE}
+          ${PROJECT_SOURCE_DIR}/tools/tests/test_fetch_git_source.py)

@@ -34,6 +34,7 @@
 #include "linglong/utils/serialize/packageinfo_handler.h"
 #include "linglong/utils/temporary_directory.h"
 #include "linglong/utils/transaction.h"
+#include "linglong/utils/unique_fd.h"
 
 #include <gio/gio.h>
 #include <glib.h>
@@ -1948,12 +1949,16 @@ void OSTreeRepo::unexportAppReference(const package::Reference &ref,
     }
 }
 
-void OSTreeRepo::exportAppReference(const package::Reference &ref,
-                                    const std::optional<std::string> &module) noexcept
+utils::error::Result<void> OSTreeRepo::exportAppReference(
+  const package::Reference &ref, const std::optional<std::string> &module) noexcept
 {
+    LINGLONG_TRACE(fmt::format("export app reference {}", ref.toString()));
+
     QDir entriesDir(this->getEntriesDir().c_str());
     if (!entriesDir.exists()) {
-        entriesDir.mkpath(".");
+        if (!entriesDir.mkpath(".")) {
+            return LINGLONG_ERR("failed to create entries directory");
+        }
     }
 
     auto items = this->cache->queryLayerItem(repoCacheQuery{
@@ -1965,8 +1970,7 @@ void OSTreeRepo::exportAppReference(const package::Reference &ref,
       .architecture = ref.arch.toString(),
     });
     if (items.empty()) {
-        LogE("Failed to export app reference {}: no layer found", ref.toString());
-        return;
+        return LINGLONG_ERR(fmt::format("no layer found to export {}", ref.toString()));
     }
 
     bool exported = false;
@@ -1977,19 +1981,18 @@ void OSTreeRepo::exportAppReference(const package::Reference &ref,
 
         auto ret = exportAppEntries(entriesDir.absolutePath().toStdString(), item);
         if (!ret) {
-            LogE("Failed to export app module {}: {}",
-                 item.info.packageInfoV2Module,
-                 ret.error().message());
-            continue;
+            return LINGLONG_ERR(
+              fmt::format("failed to export app module {}", item.info.packageInfoV2Module),
+              ret);
         }
         exported = true;
     }
 
     if (!exported) {
-        LogW("No app module entries exported for {}", ref.toString());
-        return;
+        return LINGLONG_OK;
     }
     this->updateSharedInfo();
+    return LINGLONG_OK;
 }
 
 void OSTreeRepo::exportLayerSignData(const package::Reference &ref,
@@ -2188,7 +2191,9 @@ utils::error::Result<void> OSTreeRepo::exportDir(const std::string &appID,
             auto target = source_path.lexically_relative(linkpath.parent_path());
             auto res = utils::relinkFileTo(linkpath, target);
             if (!res) {
-                LogE("failed to link {} to {}", linkpath.string(), target.string());
+                return LINGLONG_ERR(
+                  fmt::format("failed to link {} to {}", linkpath.string(), target.string()),
+                  res);
             }
             continue;
         }
@@ -2338,10 +2343,7 @@ std::string buildWrapperScriptContent(const std::string &appID,
                        cmdArgs);
 }
 
-// Content: #!/usr/bin/env sh\nexec ll-cli run <appID> -- <command...> "$@"
-// The wrapper is created atomically with O_EXCL. If the file already exists (e.g. a
-// previous version was installed), the creation is idempotent: identical content is a
-// no-op and different content is overwritten, so the script always tracks the latest command.
+// Write a complete executable beside the live script, then atomically replace it.
 utils::error::Result<void>
 createBinaryWrapperScript(const std::filesystem::path &path,
                           const std::string &appID,
@@ -2359,56 +2361,48 @@ createBinaryWrapperScript(const std::filesystem::path &path,
 
     const std::string content = buildWrapperScriptContent(appID, command);
 
-    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0755);
-    if (fd < 0) {
-        if (errno != EEXIST) {
+    auto existing = linglong::utils::readFile(path);
+    if (existing && *existing == content) {
+        return LINGLONG_OK;
+    }
+
+    auto temporaryPath = path.string() + ".XXXXXX";
+    utils::fd::UniqueFd fd(::mkostemp(temporaryPath.data(), O_CLOEXEC));
+    if (!fd) {
+        return LINGLONG_ERR(fmt::format("create temporary wrapper for {}: {}",
+                                        path,
+                                        common::error::errorString(errno)));
+    }
+    auto cleanup = utils::finally::finally([&temporaryPath] {
+        std::error_code ec;
+        std::filesystem::remove(temporaryPath, ec);
+    });
+
+    if (::fchmod(fd.get(), 0755) != 0) {
+        return LINGLONG_ERR(
+          fmt::format("fchmod {}: {}", temporaryPath, common::error::errorString(errno)));
+    }
+
+    size_t offset = 0;
+    while (offset < content.size()) {
+        auto written = ::write(fd.get(), content.data() + offset, content.size() - offset);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
             return LINGLONG_ERR(
-              fmt::format("open {}: {}", path.string(), common::error::errorString(errno)));
+              fmt::format("write {}: {}", temporaryPath, common::error::errorString(errno)));
         }
-
-        // The wrapper already exists. Keep it untouched when the content matches, otherwise
-        // overwrite so the exported command always reflects the latest version.
-        auto existing = linglong::utils::readFile(path);
-        if (existing && *existing == content) {
-            return LINGLONG_OK;
-        }
-        fd = ::open(path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
-        if (fd < 0) {
-            return LINGLONG_ERR(fmt::format("open {} for overwrite: {}",
-                                            path.string(),
-                                            common::error::errorString(errno)));
-        }
+        offset += static_cast<size_t>(written);
     }
 
-    // fchmod ensures executable bit regardless of process umask
-    if (::fchmod(fd, 0755) != 0) {
-        ::close(fd);
-        std::error_code rmEc;
-        std::filesystem::remove(path, rmEc);
+    if (::close(fd.release()) != 0) {
         return LINGLONG_ERR(
-          fmt::format("fchmod {}: {}", path.string(), common::error::errorString(errno)));
+          fmt::format("close {}: {}", temporaryPath, common::error::errorString(errno)));
     }
-
-    ssize_t written = ::write(fd, content.data(), content.size());
-    if (written < 0) {
-        ::close(fd);
-        std::error_code rmEc;
-        std::filesystem::remove(path, rmEc);
-        return LINGLONG_ERR(
-          fmt::format("write to {}: {}", path.string(), common::error::errorString(errno)));
-    }
-    if (static_cast<size_t>(written) != content.size()) {
-        ::close(fd);
-        std::error_code rmEc;
-        std::filesystem::remove(path, rmEc);
-        return LINGLONG_ERR(fmt::format("partial write to {}", path.string()));
-    }
-
-    if (::close(fd) != 0) {
-        std::error_code rmEc;
-        std::filesystem::remove(path, rmEc);
-        return LINGLONG_ERR(
-          fmt::format("close {}: {}", path.string(), common::error::errorString(errno)));
+    std::filesystem::rename(temporaryPath, path, ec);
+    if (ec) {
+        return LINGLONG_ERR(fmt::format("replace wrapper {}", path), ec);
     }
 
     return LINGLONG_OK;
@@ -2458,15 +2452,12 @@ OSTreeRepo::exportAppBinaries(const std::filesystem::path &rootEntriesDir,
     }
 
     // Helper: create a wrapper script and a symlink in entries/bin/ pointing to it
-    auto exportOne = [&](const std::string &name, const std::vector<std::string> &command) -> void {
+    auto exportOne = [&](const std::string &name,
+                         const std::vector<std::string> &command) -> utils::error::Result<void> {
         auto realScript = appBinDir / name;
         auto ret = createBinaryWrapperScript(realScript, item.info.id, command);
         if (!ret) {
-            LogW("Failed to create binary script {} for {}: {}",
-                 name,
-                 item.info.id,
-                 ret.error().message());
-            return;
+            return LINGLONG_ERR("failed to create binary wrapper", ret);
         }
         // Create relative symlink: entries/bin/<name> → apps/APPID/bin/<name>
         auto linkPath = binDir / name;
@@ -2475,21 +2466,19 @@ OSTreeRepo::exportAppBinaries(const std::filesystem::path &rootEntriesDir,
         if (std::filesystem::exists(linkPath, ec) || std::filesystem::is_symlink(linkPath, ec)) {
             // Already exists (e.g. upgrade); remove old link before creating new one
             std::filesystem::remove(linkPath, ec);
+            if (ec) {
+                return LINGLONG_ERR(fmt::format("failed to remove {}", linkPath), ec);
+            }
         }
         std::filesystem::create_symlink(target, linkPath, ec);
         if (ec) {
-            LogW("Failed to create symlink {} → {} for {}: {}",
-                 linkPath.string(),
-                 target.string(),
-                 item.info.id,
-                 ec.message());
+            return LINGLONG_ERR(fmt::format("failed to create symlink {}", linkPath), ec);
         }
+        return LINGLONG_OK;
     };
 
     // Always export a single script named after the appid, using the full command array
-    exportOne(item.info.id, cmd);
-
-    return LINGLONG_OK;
+    return exportOne(item.info.id, cmd);
 }
 
 utils::error::Result<void>
