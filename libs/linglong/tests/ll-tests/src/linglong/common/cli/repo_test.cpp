@@ -8,6 +8,9 @@
 
 #include "linglong/common/cli/repo.h"
 
+#include <cerrno>
+#include <limits>
+
 namespace linglong::common::cli {
 namespace {
 
@@ -100,6 +103,46 @@ TEST_F(RepoCommandTest, RejectDuplicateAlias)
     EXPECT_EQ(config.repos.size(), 2);
 }
 
+class InvalidRepoUrlTest : public RepoCommandTest, public ::testing::WithParamInterface<std::string>
+{
+};
+
+TEST_P(InvalidRepoUrlTest, AddDoesNotSaveInvalidEndpoint)
+{
+    parse("repo add invalid " + GetParam());
+    auto ret = handle();
+    ASSERT_FALSE(ret);
+    EXPECT_EQ(setConfigCalls, 0);
+    EXPECT_EQ(config.repos.size(), 2U);
+}
+
+TEST_P(InvalidRepoUrlTest, UpdateDoesNotReplaceWorkingEndpoint)
+{
+    parse("repo update beta " + GetParam());
+    auto ret = handle();
+    ASSERT_FALSE(ret);
+    EXPECT_EQ(setConfigCalls, 0);
+    EXPECT_EQ(config.repos[1].url, "https://beta.example");
+}
+
+INSTANTIATE_TEST_SUITE_P(InvalidEndpoints,
+                         InvalidRepoUrlTest,
+                         ::testing::Values("http",
+                                           "httpx://repo.example",
+                                           "https:///",
+                                           "https://repo.example:bad",
+                                           "https://repo.example?token=abc",
+                                           "https://repo.example#fragment"));
+
+TEST_F(RepoCommandTest, AcceptsUppercaseHttpSchemeAndBasePath)
+{
+    parse("repo add community HTTPS://community.example/base/");
+    auto ret = handle();
+    ASSERT_TRUE(ret) << ret.error().message();
+    ASSERT_EQ(setConfigCalls, 1);
+    EXPECT_EQ(config.repos.back().url, "HTTPS://community.example/base");
+}
+
 TEST_F(RepoCommandTest, UpdateRepoUrl)
 {
     parse("repo update beta https://new-beta.example/");
@@ -134,6 +177,38 @@ TEST_F(RepoCommandTest, SetDefaultRaisesPriority)
     ASSERT_EQ(setConfigCalls, 1);
     EXPECT_EQ(config.defaultRepo, "beta");
     EXPECT_EQ(config.repos[1].priority, 120);
+}
+
+TEST_F(RepoCommandTest, RejectsDefaultPriorityOverflowWithoutSaving)
+{
+    config.repos[0].priority = std::numeric_limits<std::int64_t>::max();
+    parse("repo set-default beta");
+    auto ret = handle();
+    ASSERT_FALSE(ret);
+    EXPECT_EQ(ret.error().code(), ERANGE);
+    EXPECT_EQ(setConfigCalls, 0);
+    EXPECT_EQ(config.defaultRepo, "stable");
+    EXPECT_EQ(config.repos[1].priority, 20);
+}
+
+TEST_F(RepoCommandTest, DefaultPriorityCanReachMaximumExactly)
+{
+    config.repos[0].priority = std::numeric_limits<std::int64_t>::max() - 100;
+    parse("repo set-default beta");
+    auto ret = handle();
+    ASSERT_TRUE(ret) << ret.error().message();
+    EXPECT_EQ(setConfigCalls, 1);
+    EXPECT_EQ(config.defaultRepo, "beta");
+    EXPECT_EQ(config.repos[1].priority, std::numeric_limits<std::int64_t>::max());
+}
+
+TEST_F(RepoCommandTest, ExistingDefaultAtMaximumDoesNotNeedPriorityRaise)
+{
+    config.repos[0].priority = std::numeric_limits<std::int64_t>::max();
+    parse("repo set-default stable");
+    auto ret = handle();
+    ASSERT_TRUE(ret) << ret.error().message();
+    EXPECT_EQ(setConfigCalls, 0);
 }
 
 TEST_F(RepoCommandTest, SetPriority)

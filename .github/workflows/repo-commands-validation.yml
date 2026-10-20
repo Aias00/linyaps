@@ -1,0 +1,42 @@
+name: Repository commands Linux validation
+on:
+  push:
+    branches: ['validation/repo-commands-linux']
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build debhelper-compat erofs-utils erofsfuse intltool libcap-dev libcli11-dev libcurl4-openssl-dev libdeflate-dev libelf-dev libexpected-dev libfuse3-dev libglib2.0-dev libgmock-dev libgtest-dev liblz4-dev liblzma-dev libostree-dev libpcre2-dev libselinux1-dev libssl-dev libsystemd-dev libyaml-cpp-dev libzstd-dev nlohmann-json3-dev pkg-config zlib1g-dev libwayland-dev wayland-protocols libgl1-mesa-dev qt6-base-dev qt6-base-private-dev dbus
+      - name: Configure
+        run: cmake -B build -GNinja -DCMAKE_BUILD_TYPE=Release -DCPM_LOCAL_PACKAGES_ONLY=ON -DLINGLONG_ENABLE_WAYLAND_SEC_CTX_SUPPORT=ON
+      - name: Build
+        run: cmake --build build --parallel 3
+      - name: Repository command regressions
+        run: |
+          testbin=$(find build -type f -name ll-tests -executable | head -1)
+          "$testbin" --gtest_filter='RepoCommandTest.*:InvalidEndpoints/InvalidRepoUrlTest.*' --gtest_output=xml:build/focused.xml
+          python3 - <<'PYTEST'
+          import xml.etree.ElementTree as E
+          r=E.parse('build/focused.xml').getroot()
+          assert int(r.attrib['tests']) == 27
+          assert all(not t.findall('skipped') for t in r.iter('testcase'))
+          PYTEST
+      - name: Full CTest
+        if: success() || failure()
+        run: ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 --output-junit full-tests.xml
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-commands-linux-results
+          path: |
+            build/focused.xml
+            build/full-tests.xml
+            build/Testing/Temporary/LastTest.log

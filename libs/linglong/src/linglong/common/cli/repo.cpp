@@ -10,8 +10,11 @@
 #include "linglong/utils/gettext.h"
 #include "linglong/utils/log/log.h"
 
+#include <QUrl>
+
 #include <algorithm>
 #include <cerrno>
+#include <limits>
 
 namespace linglong::common::cli {
 
@@ -168,7 +171,10 @@ utils::error::Result<void> handleRepoCommand(CLI::App *app,
             return LINGLONG_ERR("url is empty.", EINVAL);
         }
 
-        if (url.rfind("http", 0) != 0) {
+        const QUrl parsedUrl(QString::fromStdString(url), QUrl::StrictMode);
+        if (!parsedUrl.isValid() || parsedUrl.host().isEmpty()
+            || (parsedUrl.scheme() != "http" && parsedUrl.scheme() != "https")
+            || parsedUrl.hasQuery() || parsedUrl.hasFragment()) {
             return LINGLONG_ERR("url is invalid: " + url, EINVAL);
         }
 
@@ -275,8 +281,12 @@ utils::error::Result<void> handleRepoCommand(CLI::App *app,
 
     if (argsParsed("set-default")) {
         if (cfgRef.defaultRepo != alias) {
-            cfgRef.defaultRepo = alias;
             auto maxPriority = getRepoMaxPriority(cfgRef);
+            if (maxPriority > std::numeric_limits<std::int64_t>::max() - 100) {
+                return LINGLONG_ERR("cannot raise default repository priority: integer overflow",
+                                    ERANGE);
+            }
+            cfgRef.defaultRepo = alias;
             for (auto &repo : cfgRef.repos) {
                 if (repo.alias.value_or(repo.name) == alias) {
                     repo.priority = maxPriority + 100;
